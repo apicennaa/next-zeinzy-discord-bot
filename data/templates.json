@@ -1,0 +1,14 @@
+{
+    "office": {
+        "label": "🏢 OFFICE",
+        "templates": {}
+    },
+    "ai": {
+        "label": "🤖 ZEINZY AI",
+        "templates": {}
+    },
+    "wedding": {
+        "label": "💍 ZEINZY WEDDING",
+        "templates": {}
+    }
+}
