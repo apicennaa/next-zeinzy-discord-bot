@@ -60,6 +60,29 @@ const getExpenseById = db.prepare(`
     SELECT * FROM expenses WHERE id = ?
 `);
 
+/**
+ * Update ledger tracking setelah Discord post berhasil.
+ * Menggunakan conditional UPDATE (WHERE ledger_message_id IS NULL) sebagai
+ * proteksi race-condition minimal di level SQLite:
+ * - Hanya baris yang BELUM punya ledger_message_id yang diupdate.
+ * - Jika dua request hampir bersamaan, hanya satu yang akan berhasil
+ *   mengupdate (changes === 1), request kedua mendapat changes === 0.
+ *
+ * @param {number|bigint} expenseId
+ * @param {string} messageId - Discord message snowflake ID
+ * @param {string} postedAt  - UTC ISO timestamp
+ * @returns {number} jumlah baris yang diupdate (0 atau 1)
+ */
+const updateLedgerTracking = db.prepare(`
+    UPDATE expenses
+    SET
+        ledger_message_id = @messageId,
+        ledger_posted_at  = @postedAt
+    WHERE
+        id = @expenseId
+        AND ledger_message_id IS NULL
+`);
+
 // ─── Shared ledger builder ───────────────────────────────────────────────────
 /**
  * Membangun EmbedBuilder dari baris expense di database.
@@ -110,15 +133,15 @@ function buildLedgerEmbed(row, posterUserId) {
 // ─── Shared channel poster ───────────────────────────────────────────────────
 /**
  * Fetch channel dari EXPENSE_CHANNEL_ID, validasi, lalu kirim embed.
- * Return { ok: true, channelId } jika sukses.
- * Return { ok: false, channelId, message } jika gagal — caller yang tentukan response ke user.
+ * Return { ok: true, channelId, message } jika sukses — message adalah Discord Message object.
+ * Return { ok: false, channelId, errorMessage } jika gagal — caller yang tentukan response ke user.
  *
  * @param {import("discord.js").Client} client
  * @param {EmbedBuilder} embed
  * @param {boolean} isImage        - Apakah bukti sudah ditampilkan sebagai image di embed
  * @param {string} proofUrl        - URL bukti pembayaran
  * @param {string} context         - Label untuk console.error (mis. "expense add #1")
- * @returns {Promise<{ ok: boolean, channelId: string|null, message?: string }>}
+ * @returns {Promise<{ ok: boolean, channelId: string|null, message?: import("discord.js").Message, errorMessage?: string }>}
  */
 async function postLedgerToChannel(client, embed, isImage, proofUrl, context) {
     const channelId = process.env.EXPENSE_CHANNEL_ID;
@@ -128,7 +151,7 @@ async function postLedgerToChannel(client, embed, isImage, proofUrl, context) {
         return {
             ok: false,
             channelId: null,
-            message: "`EXPENSE_CHANNEL_ID` belum dikonfigurasi. Hubungi admin.",
+            errorMessage: "`EXPENSE_CHANNEL_ID` belum dikonfigurasi. Hubungi admin.",
         };
     }
 
@@ -140,7 +163,7 @@ async function postLedgerToChannel(client, embed, isImage, proofUrl, context) {
         return {
             ok: false,
             channelId,
-            message: `Gagal menemukan channel expenses (ID: \`${channelId}\`).`,
+            errorMessage: `Gagal menemukan channel expenses (ID: \`${channelId}\`).`,
         };
     }
 
@@ -149,27 +172,28 @@ async function postLedgerToChannel(client, embed, isImage, proofUrl, context) {
         return {
             ok: false,
             channelId,
-            message: `Channel expenses tidak valid atau bukan text channel (ID: \`${channelId}\`).`,
+            errorMessage: `Channel expenses tidak valid atau bukan text channel (ID: \`${channelId}\`).`,
         };
     }
 
+    let sentMessage;
     try {
         const payload = { embeds: [embed] };
         // Jika bukti bukan image yang sudah di-embed, sertakan URL sebagai teks
         if (!isImage) {
             payload.content = `📎 **Bukti pembayaran:** ${proofUrl}`;
         }
-        await channel.send(payload);
+        sentMessage = await channel.send(payload);
     } catch (err) {
         console.error(`❌ [${context}] Gagal send ke channel ${channelId}:`, err);
         return {
             ok: false,
             channelId,
-            message: `Gagal mengirim pesan ke <#${channelId}>.`,
+            errorMessage: `Gagal mengirim pesan ke <#${channelId}>.`,
         };
     }
 
-    return { ok: true, channelId };
+    return { ok: true, channelId, message: sentMessage };
 }
 
 // ─── Command definition ──────────────────────────────────────────────────────
@@ -378,7 +402,7 @@ async function handleAdd(interaction) {
     }
 
     // ── Post ke channel ────────────────────────────────────────────────────
-    const result = await postLedgerToChannel(
+    const postResult = await postLedgerToChannel(
         interaction.client,
         embed,
         finalIsImage,
@@ -386,16 +410,33 @@ async function handleAdd(interaction) {
         `expense add #${newId}`
     );
 
-    if (!result.ok) {
-        const channelPart = result.channelId ? ` ke <#${result.channelId}>` : "";
+    // ── Jika Discord post gagal ────────────────────────────────────────────
+    // Expense tetap tersimpan, ledger tracking tetap NULL — jangan rollback.
+    if (!postResult.ok) {
+        const channelPart = postResult.channelId ? ` ke <#${postResult.channelId}>` : "";
         return interaction.reply({
-            content: `⚠️ Expense **#${newId}** sudah tersimpan di database, tetapi gagal dipost${channelPart}: ${result.message}\n\n**Jangan input ulang expense ini.**`,
+            content: `⚠️ Expense **#${newId}** sudah tersimpan di database, tetapi gagal dipost${channelPart}: ${postResult.errorMessage}\n\n**Jangan input ulang expense ini.** Gunakan \`/expense repost id:${newId}\` untuk mencoba post ledger kembali.`,
             ephemeral: true,
         });
     }
 
+    // ── Discord post berhasil — simpan ledger tracking ─────────────────────
+    const postedAt = new Date().toISOString(); // UTC ISO timestamp
+    try {
+        updateLedgerTracking.run({
+            expenseId: newId,
+            messageId: postResult.message.id,
+            postedAt,
+        });
+        console.log(`✅ [expense add #${newId}] Ledger tracking tersimpan: message=${postResult.message.id}`);
+    } catch (err) {
+        // Ledger sudah terkirim ke Discord — ini hanya tracking failure, bukan critical error.
+        // Log warning tapi tetap laporkan sukses ke user.
+        console.error(`⚠️ [expense add #${newId}] Ledger terkirim ke Discord tapi gagal simpan tracking:`, err);
+    }
+
     return interaction.reply({
-        content: `✅ Expense **#${newId}** berhasil dicatat di <#${result.channelId}>.`,
+        content: `✅ Expense **#${newId}** berhasil dicatat di <#${postResult.channelId}>.`,
         ephemeral: true,
     });
 }
@@ -414,12 +455,97 @@ async function handleRepost(interaction) {
         });
     }
 
+    // ── Guard: tiga state ledger eksplisit ────────────────────────────────
+    // State dibaca dari DB sebelum apapun dilakukan.
+    // Tiga state yang mungkin:
+    //   A. NULL             → expense belum punya ledger, boleh claim
+    //   B. 'PENDING'        → sedang diklaim oleh request lain dalam process ini
+    //                         (bukan stale dari crash — startup cleanup sudah bersihkan)
+    //   C. real message ID  → ledger sudah ada di Discord, jangan repost
+    const currentLedgerMsgId = row.ledger_message_id ?? null;
+
+    // State B: PENDING — request lain sedang dalam proses Discord .send()
+    // JANGAN anggap ledger sudah ada, JANGAN buat URL /PENDING.
+    if (currentLedgerMsgId === "PENDING") {
+        return interaction.reply({
+            content: `⏳ Expense **#${expenseId}** sedang diproses untuk ledger. Coba lagi setelah proses selesai.`,
+            ephemeral: true,
+        });
+    }
+
+    // State C: real Discord message ID — ledger sudah ada
+    if (currentLedgerMsgId !== null) {
+        const channelId = process.env.EXPENSE_CHANNEL_ID;
+        const guildId   = process.env.GUILD_ID;
+
+        // Bangun link ke message ledger existing (convenience, bukan business logic)
+        let ledgerLink = "";
+        if (guildId && channelId && currentLedgerMsgId) {
+            ledgerLink = `\n\n🔗 [Lihat ledger existing](https://discord.com/channels/${guildId}/${channelId}/${currentLedgerMsgId})`;
+        }
+
+        return interaction.reply({
+            content: `⚠️ Expense **#${expenseId}** sudah memiliki ledger di <#${channelId ?? "expenses"}> dan tidak dipost ulang.${ledgerLink}`,
+            ephemeral: true,
+        });
+    }
+
+    // State A: NULL — attempt atomic claim dengan PENDING placeholder
+    // ──────────────────────────────────────────────────────────────────────
+    // Conditional UPDATE: hanya update jika ledger_message_id masih NULL.
+    // Jika dua /expense repost hampir bersamaan:
+    //   - Request A: UPDATE berhasil (changes=1) → lanjut ke Discord .send()
+    //   - Request B: UPDATE gagal (changes=0)   → ditolak, re-read state terbaru
+    // Proteksi race-condition minimal untuk single-instance Node.js.
+    //
+    // 'PENDING' adalah transient lock — bukan nilai final.
+    // postedAt saat claim ini adalah SEMENTARA dan akan di-overwrite dengan
+    // timestamp asli saat Discord .send() berhasil (lihat bagian final success).
+    const claimResult = updateLedgerTracking.run({
+        expenseId,
+        messageId: "PENDING",
+        postedAt:  new Date().toISOString(), // transient — di-overwrite saat success
+    });
+
+    if (claimResult.changes === 0) {
+        // Claim gagal — ada request lain yang lebih dulu mengisi slot ini.
+        // Re-read dari DB untuk memberi response yang akurat berdasarkan state terbaru.
+        const freshRow      = getExpenseById.get(expenseId);
+        const freshLedgerId = freshRow?.ledger_message_id ?? null;
+
+        if (freshLedgerId === "PENDING") {
+            return interaction.reply({
+                content: `⏳ Expense **#${expenseId}** sedang diproses untuk ledger. Coba lagi setelah proses selesai.`,
+                ephemeral: true,
+            });
+        }
+
+        if (freshLedgerId !== null) {
+            const channelId = process.env.EXPENSE_CHANNEL_ID;
+            const guildId   = process.env.GUILD_ID;
+            let ledgerLink = "";
+            if (guildId && channelId && freshLedgerId) {
+                ledgerLink = `\n\n🔗 [Lihat ledger existing](https://discord.com/channels/${guildId}/${channelId}/${freshLedgerId})`;
+            }
+            return interaction.reply({
+                content: `⚠️ Expense **#${expenseId}** sudah memiliki ledger di <#${channelId ?? "expenses"}> dan tidak dipost ulang.${ledgerLink}`,
+                ephemeral: true,
+            });
+        }
+
+        // Fallback: state tidak terduga setelah re-read
+        return interaction.reply({
+            content: `⚠️ Expense **#${expenseId}** tidak dapat diproses saat ini. Coba lagi.`,
+            ephemeral: true,
+        });
+    }
+
     // ── Bangun embed dari data DB ──────────────────────────────────────────
     // posterUserId = null karena kita tidak tahu user Discord original dari DB
     const { embed, isImage } = buildLedgerEmbed(row, null);
 
     // ── Post ke channel ────────────────────────────────────────────────────
-    const result = await postLedgerToChannel(
+    const postResult = await postLedgerToChannel(
         interaction.client,
         embed,
         isImage,
@@ -427,16 +553,50 @@ async function handleRepost(interaction) {
         `expense repost #${expenseId}`
     );
 
-    if (!result.ok) {
-        const channelPart = result.channelId ? ` ke <#${result.channelId}>` : "";
+    if (!postResult.ok) {
+        // Discord post gagal — rollback PENDING placeholder ke NULL
+        // agar repost bisa dicoba kembali.
+        try {
+            db.prepare(`
+                UPDATE expenses
+                SET ledger_message_id = NULL, ledger_posted_at = NULL
+                WHERE id = ? AND ledger_message_id = 'PENDING'
+            `).run(expenseId);
+            console.warn(`⚠️ [expense repost #${expenseId}] PENDING placeholder di-rollback karena Discord post gagal.`);
+        } catch (rollbackErr) {
+            console.error(`❌ [expense repost #${expenseId}] Gagal rollback PENDING placeholder:`, rollbackErr);
+        }
+
+        const channelPart = postResult.channelId ? ` ke <#${postResult.channelId}>` : "";
         return interaction.reply({
-            content: `⚠️ Gagal repost Expense **#${expenseId}**${channelPart}: ${result.message}\n\nData di database tidak berubah.`,
+            content: `⚠️ Gagal repost Expense **#${expenseId}**${channelPart}: ${postResult.errorMessage}\n\nData di database tidak berubah.`,
             ephemeral: true,
         });
     }
 
+    // ── Discord post berhasil — simpan real message ID dan timestamp final ──
+    // Timestamp ini (bukan timestamp saat claim PENDING) adalah nilai final
+    // ledger_posted_at — merepresentasikan waktu ledger benar-benar berhasil
+    // dipost ke Discord.
+    const realMessageId = postResult.message.id;
+    const postedAt      = new Date().toISOString(); // timestamp final, overwrite nilai transient PENDING
+
+    try {
+        // Update baris yang masih PENDING dengan message ID asli dari Discord
+        db.prepare(`
+            UPDATE expenses
+            SET ledger_message_id = ?, ledger_posted_at = ?
+            WHERE id = ? AND ledger_message_id = 'PENDING'
+        `).run(realMessageId, postedAt, expenseId);
+        console.log(`✅ [expense repost #${expenseId}] Ledger tracking tersimpan: message=${realMessageId}`);
+    } catch (err) {
+        // Ledger sudah terkirim ke Discord — ini hanya tracking failure.
+        // Log error tapi tetap laporkan sukses ke user.
+        console.error(`⚠️ [expense repost #${expenseId}] Ledger terkirim ke Discord tapi gagal update tracking:`, err);
+    }
+
     return interaction.reply({
-        content: `✅ Expense **#${expenseId}** berhasil dipost ke <#${result.channelId}>.`,
+        content: `✅ Expense **#${expenseId}** berhasil dipost ke <#${postResult.channelId}>.`,
         ephemeral: true,
     });
 }
