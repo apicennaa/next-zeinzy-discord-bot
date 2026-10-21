@@ -1,60 +1,38 @@
 const { SlashCommandBuilder, EmbedBuilder } = require("discord.js");
 const db = require("../database/db");
-
-// ─── Helpers ────────────────────────────────────────────────────────────────
-
-/**
- * Validasi format dan keabsahan tanggal YYYY-MM-DD.
- * Menggunakan Date() untuk memastikan tanggal benar-benar valid
- * (mis. 2026-02-30 akan ditolak).
- * @param {string} str
- * @returns {boolean}
- */
-function isValidDate(str) {
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(str)) return false;
-    const d = new Date(str);
-    if (isNaN(d.getTime())) return false;
-    // Pastikan tidak ada overflow (misal Feb 30 → Mar 2)
-    return d.toISOString().startsWith(str);
-}
-
-/**
- * Format integer Rupiah menjadi "Rp1.000.000"
- * @param {number} amount
- * @returns {string}
- */
-function formatRupiah(amount) {
-    return "Rp" + amount.toLocaleString("id-ID");
-}
-
-/**
- * Format tanggal ISO "YYYY-MM-DD" menjadi "19 Oktober 2026" (Bahasa Indonesia).
- * @param {string} isoDate
- * @returns {string}
- */
-function formatTanggalReadable(isoDate) {
-    // new Date("YYYY-MM-DD") diparse sebagai UTC — tambah T00:00:00 agar konsisten
-    const d = new Date(isoDate + "T00:00:00");
-    return d.toLocaleDateString("id-ID", {
-        day: "numeric",
-        month: "long",
-        year: "numeric",
-    });
-}
-
-// ─── Warna embed per scope ───────────────────────────────────────────────────
-const SCOPE_COLOR = {
-    AI:      0x5865F2, // Discord Blurple — untuk ZEINZY AI
-    WEDDING: 0xF47FFF, // Soft Pink/Lavender — untuk ZEINZY WEDDING
-};
+const {
+    isValidDate,
+    formatRupiah,
+    formatTanggalReadable,
+    SCOPE_COLOR,
+} = require("../utils/formatters");
 
 // ─── Prepared statements ─────────────────────────────────────────────────────
+
 const insertExpense = db.prepare(`
     INSERT INTO expenses
-        (name, amount, paid_at, scope, is_recurring, next_due_at, payment_proof_url, notes)
+        (name, amount, paid_at, scope, is_recurring, next_due_at, payment_proof_url, notes, recurring_series_id, cycle_status)
     VALUES
-        (@name, @amount, @paid_at, @scope, @is_recurring, @next_due_at, @payment_proof_url, @notes)
+        (@name, @amount, @paid_at, @scope, @is_recurring, @next_due_at, @payment_proof_url, @notes, @recurring_series_id, @cycle_status)
 `);
+
+/**
+ * Transaksi pembuatan expense baru:
+ * Jika is_recurring = 1, recurring_series_id langsung diisi dengan own id.
+ * Jika is_recurring = 0, recurring_series_id dan cycle_status tetap NULL.
+ */
+const createExpenseTx = db.transaction(params => {
+    const result = insertExpense.run(params);
+    const newId = result.lastInsertRowid;
+    if (params.is_recurring === 1) {
+        db.prepare(`
+            UPDATE expenses
+            SET recurring_series_id = id
+            WHERE id = ?
+        `).run(newId);
+    }
+    return newId;
+});
 
 const getExpenseById = db.prepare(`
     SELECT * FROM expenses WHERE id = ?
@@ -63,15 +41,7 @@ const getExpenseById = db.prepare(`
 /**
  * Update ledger tracking setelah Discord post berhasil.
  * Menggunakan conditional UPDATE (WHERE ledger_message_id IS NULL) sebagai
- * proteksi race-condition minimal di level SQLite:
- * - Hanya baris yang BELUM punya ledger_message_id yang diupdate.
- * - Jika dua request hampir bersamaan, hanya satu yang akan berhasil
- *   mengupdate (changes === 1), request kedua mendapat changes === 0.
- *
- * @param {number|bigint} expenseId
- * @param {string} messageId - Discord message snowflake ID
- * @param {string} postedAt  - UTC ISO timestamp
- * @returns {number} jumlah baris yang diupdate (0 atau 1)
+ * proteksi race-condition minimal di level SQLite.
  */
 const updateLedgerTracking = db.prepare(`
     UPDATE expenses
@@ -83,15 +53,97 @@ const updateLedgerTracking = db.prepare(`
         AND ledger_message_id IS NULL
 `);
 
+/**
+ * Transaksi Mark Paid:
+ * 1. Re-read source expense di dalam transaksi
+ * 2. Validasi status masih ACTIVE, is_recurring = 1, dan memiliki recurring_series_id
+ * 3. UPDATE source: ACTIVE -> SUPERSEDED secara kondisional (WHERE cycle_status = 'ACTIVE')
+ * 4. Pastikan changes === 1 (proteksi concurrent mark-paid)
+ * 5. INSERT new cycle:
+ *    - name & scope diwariskan dari source
+ *    - nominal & tanggal dari input aktual
+ *    - is_recurring = 1, cycle_status = 'ACTIVE'
+ *    - next_due_at dari input
+ *    - recurring_series_id = source.recurring_series_id
+ *    - ledger tracking = NULL (dipost setelah transaksi commit)
+ * 6. Return { source, newExpenseId }
+ */
+const markPaidTransaction = db.transaction((sourceId, inputData) => {
+    const source = db.prepare("SELECT * FROM expenses WHERE id = ?").get(sourceId);
+
+    if (!source) {
+        throw new Error("EXPENSE_NOT_FOUND");
+    }
+    if (source.is_recurring !== 1) {
+        throw new Error("NOT_RECURRING");
+    }
+    if (source.cycle_status !== "ACTIVE") {
+        throw new Error("NOT_ACTIVE");
+    }
+    if (!source.recurring_series_id) {
+        throw new Error("NO_SERIES_ID");
+    }
+
+    const updateResult = db.prepare(`
+        UPDATE expenses
+        SET cycle_status = 'SUPERSEDED'
+        WHERE id = ? AND cycle_status = 'ACTIVE'
+    `).run(sourceId);
+
+    if (updateResult.changes !== 1) {
+        throw new Error("CONCURRENT_CONFLICT");
+    }
+
+    const insertResult = db.prepare(`
+        INSERT INTO expenses (
+            name,
+            amount,
+            paid_at,
+            scope,
+            is_recurring,
+            next_due_at,
+            payment_proof_url,
+            notes,
+            recurring_series_id,
+            cycle_status,
+            ledger_message_id,
+            ledger_posted_at
+        ) VALUES (
+            @name,
+            @amount,
+            @paid_at,
+            @scope,
+            1,
+            @next_due_at,
+            @payment_proof_url,
+            @notes,
+            @recurring_series_id,
+            'ACTIVE',
+            NULL,
+            NULL
+        )
+    `).run({
+        name: source.name,
+        amount: inputData.amount,
+        paid_at: inputData.paid_at,
+        scope: source.scope,
+        next_due_at: inputData.next_due_at,
+        payment_proof_url: inputData.payment_proof_url,
+        notes: inputData.notes,
+        recurring_series_id: source.recurring_series_id,
+    });
+
+    return {
+        source,
+        newExpenseId: insertResult.lastInsertRowid,
+    };
+});
+
 // ─── Shared ledger builder ───────────────────────────────────────────────────
 /**
  * Membangun EmbedBuilder dari baris expense di database.
- *
- * Parameter `posterUserId` adalah Discord user ID yang akan di-mention di field
- * "Dicatat oleh". Boleh null jika tidak diketahui (mis. repost tanpa context user asli).
- *
- * @param {object} row         - Baris dari tabel expenses
- * @param {string|null} posterUserId - Discord user ID (string snowflake) atau null
+ * @param {object} row - Baris dari tabel expenses
+ * @param {string|null} posterUserId - Discord user ID atau null
  * @returns {{ embed: EmbedBuilder, isImage: boolean }}
  */
 function buildLedgerEmbed(row, posterUserId) {
@@ -101,10 +153,6 @@ function buildLedgerEmbed(row, posterUserId) {
     const catatanLabel = row.notes ?? "-";
     const dicatatOleh  = posterUserId ? `<@${posterUserId}>` : "-";
 
-    // Cek apakah URL bukti mengarah ke image (heuristik dari ekstensi URL)
-    // Karena data dari DB tidak punya contentType, kita cek ekstensi URL.
-    // Untuk data baru dari /add, contentType dari attachment digunakan langsung.
-    // Untuk repost dari DB, kita andalkan ekstensi.
     const imageExts = /\.(jpg|jpeg|png|gif|webp)(\?|$)/i;
     const isImage   = imageExts.test(row.payment_proof_url);
 
@@ -133,14 +181,11 @@ function buildLedgerEmbed(row, posterUserId) {
 // ─── Shared channel poster ───────────────────────────────────────────────────
 /**
  * Fetch channel dari EXPENSE_CHANNEL_ID, validasi, lalu kirim embed.
- * Return { ok: true, channelId, message } jika sukses — message adalah Discord Message object.
- * Return { ok: false, channelId, errorMessage } jika gagal — caller yang tentukan response ke user.
- *
  * @param {import("discord.js").Client} client
  * @param {EmbedBuilder} embed
- * @param {boolean} isImage        - Apakah bukti sudah ditampilkan sebagai image di embed
- * @param {string} proofUrl        - URL bukti pembayaran
- * @param {string} context         - Label untuk console.error (mis. "expense add #1")
+ * @param {boolean} isImage
+ * @param {string} proofUrl
+ * @param {string} context
  * @returns {Promise<{ ok: boolean, channelId: string|null, message?: import("discord.js").Message, errorMessage?: string }>}
  */
 async function postLedgerToChannel(client, embed, isImage, proofUrl, context) {
@@ -179,7 +224,6 @@ async function postLedgerToChannel(client, embed, isImage, proofUrl, context) {
     let sentMessage;
     try {
         const payload = { embeds: [embed] };
-        // Jika bukti bukan image yang sudah di-embed, sertakan URL sebagai teks
         if (!isImage) {
             payload.content = `📎 **Bukti pembayaran:** ${proofUrl}`;
         }
@@ -207,14 +251,12 @@ module.exports = {
             subcommand
                 .setName("add")
                 .setDescription("Catat expense baru")
-                // 1. nama
                 .addStringOption(option =>
                     option
                         .setName("nama")
                         .setDescription("Nama expense (contoh: VPS Biznet)")
                         .setRequired(true)
                 )
-                // 2. nominal
                 .addIntegerOption(option =>
                     option
                         .setName("nominal")
@@ -222,7 +264,6 @@ module.exports = {
                         .setRequired(true)
                         .setMinValue(1)
                 )
-                // 3. scope
                 .addStringOption(option =>
                     option
                         .setName("scope")
@@ -233,14 +274,12 @@ module.exports = {
                             { name: "💍 ZEINZY WEDDING", value: "WEDDING" }
                         )
                 )
-                // 4. tanggal
                 .addStringOption(option =>
                     option
                         .setName("tanggal")
                         .setDescription("Tanggal pembayaran (format: YYYY-MM-DD, contoh: 2026-10-19)")
                         .setRequired(true)
                 )
-                // 5. recurring
                 .addStringOption(option =>
                     option
                         .setName("recurring")
@@ -251,21 +290,18 @@ module.exports = {
                             { name: "Tidak", value: "Tidak" }
                         )
                 )
-                // 6. bukti
                 .addAttachmentOption(option =>
                     option
                         .setName("bukti")
                         .setDescription("Bukti pembayaran (screenshot/foto)")
                         .setRequired(true)
                 )
-                // 7. next_due (optional Discord, wajib jika recurring=Ya)
                 .addStringOption(option =>
                     option
                         .setName("next_due")
                         .setDescription("Tanggal jatuh tempo berikutnya (WAJIB jika Recurring: Ya, format: YYYY-MM-DD)")
                         .setRequired(false)
                 )
-                // 8. catatan (optional)
                 .addStringOption(option =>
                     option
                         .setName("catatan")
@@ -286,14 +322,60 @@ module.exports = {
                         .setRequired(true)
                         .setMinValue(1)
                 )
+        )
+
+        // ── Subcommand: mark-paid ────────────────────────────────────────────
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName("mark-paid")
+                .setDescription("Tandai pembayaran tagihan recurring dan mulai siklus jatuh tempo baru")
+                .addIntegerOption(option =>
+                    option
+                        .setName("id")
+                        .setDescription("ID expense dari siklus aktif yang ingin ditandai lunas (contoh: 2)")
+                        .setRequired(true)
+                        .setMinValue(1)
+                )
+                .addIntegerOption(option =>
+                    option
+                        .setName("nominal")
+                        .setDescription("Nominal pembayaran aktual dalam Rupiah (min 1)")
+                        .setRequired(true)
+                        .setMinValue(1)
+                )
+                .addStringOption(option =>
+                    option
+                        .setName("tanggal")
+                        .setDescription("Tanggal pembayaran aktual (format: YYYY-MM-DD, contoh: 2026-11-19)")
+                        .setRequired(true)
+                )
+                .addStringOption(option =>
+                    option
+                        .setName("next_due")
+                        .setDescription("Tanggal jatuh tempo berikutnya (format: YYYY-MM-DD, harus > tanggal bayar)")
+                        .setRequired(true)
+                )
+                .addAttachmentOption(option =>
+                    option
+                        .setName("bukti")
+                        .setDescription("Bukti pembayaran baru (screenshot/foto)")
+                        .setRequired(true)
+                )
+                .addStringOption(option =>
+                    option
+                        .setName("catatan")
+                        .setDescription("Catatan tambahan untuk siklus baru ini (opsional)")
+                        .setRequired(false)
+                )
         ),
 
     // ─── Execute ─────────────────────────────────────────────────────────────
     async execute(interaction) {
         const sub = interaction.options.getSubcommand();
 
-        if (sub === "add")    return handleAdd(interaction);
-        if (sub === "repost") return handleRepost(interaction);
+        if (sub === "add")       return handleAdd(interaction);
+        if (sub === "repost")    return handleRepost(interaction);
+        if (sub === "mark-paid") return handleMarkPaid(interaction);
 
         return interaction.reply({
             content: "⚠️ Subcommand tidak dikenal.",
@@ -304,7 +386,6 @@ module.exports = {
 
 // ─── Handler: /expense add ───────────────────────────────────────────────────
 async function handleAdd(interaction) {
-    // ── Ambil semua input ──────────────────────────────────────────────────
     const nama      = interaction.options.getString("nama").trim();
     const nominal   = interaction.options.getInteger("nominal");
     const scope     = interaction.options.getString("scope");
@@ -315,8 +396,6 @@ async function handleAdd(interaction) {
     const catatan   = interaction.options.getString("catatan")?.trim() ?? null;
 
     // ── Validasi ───────────────────────────────────────────────────────────
-
-    // 1. nominal
     if (nominal <= 0) {
         return interaction.reply({
             content: "❌ **Nominal tidak valid.** Harus lebih dari 0.",
@@ -324,7 +403,6 @@ async function handleAdd(interaction) {
         });
     }
 
-    // 2. scope
     if (!["AI", "WEDDING"].includes(scope)) {
         return interaction.reply({
             content: "❌ **Scope tidak valid.** Pilih antara `AI` atau `WEDDING`.",
@@ -332,7 +410,6 @@ async function handleAdd(interaction) {
         });
     }
 
-    // 3. format & validitas tanggal
     if (!isValidDate(tanggal)) {
         return interaction.reply({
             content: `❌ **Format tanggal tidak valid:** \`${tanggal}\`\nGunakan format \`YYYY-MM-DD\` dengan tanggal yang benar, contoh: \`2026-10-19\`.`,
@@ -340,7 +417,6 @@ async function handleAdd(interaction) {
         });
     }
 
-    // 4. next_due: wajib jika recurring = Ya
     if (recurring === "Ya") {
         if (!nextDue) {
             return interaction.reply({
@@ -354,27 +430,35 @@ async function handleAdd(interaction) {
                 ephemeral: true,
             });
         }
+        if (nextDue <= tanggal) {
+            return interaction.reply({
+                content: `❌ **\`next_due\` (${nextDue}) harus lebih besar dari tanggal pembayaran (${tanggal}).**`,
+                ephemeral: true,
+            });
+        }
     }
 
     // ── Siapkan data untuk INSERT ──────────────────────────────────────────
-    const isRecurringInt = recurring === "Ya" ? 1 : 0;
-    const nextDueValue   = recurring === "Ya" ? nextDue : null;
-    const proofUrl       = bukti.url;
+    const isRecurringInt   = recurring === "Ya" ? 1 : 0;
+    const nextDueValue     = recurring === "Ya" ? nextDue : null;
+    const cycleStatusValue = recurring === "Ya" ? "ACTIVE" : null;
+    const proofUrl         = bukti.url;
 
-    // ── INSERT ke SQLite ───────────────────────────────────────────────────
+    // ── INSERT ke SQLite via createExpenseTx ───────────────────────────────
     let newId;
     try {
-        const result = insertExpense.run({
-            name:               nama,
-            amount:             nominal,
-            paid_at:            tanggal,
-            scope:              scope,
-            is_recurring:       isRecurringInt,
-            next_due_at:        nextDueValue,
-            payment_proof_url:  proofUrl,
-            notes:              catatan,
+        newId = createExpenseTx({
+            name:                nama,
+            amount:              nominal,
+            paid_at:             tanggal,
+            scope:               scope,
+            is_recurring:        isRecurringInt,
+            next_due_at:         nextDueValue,
+            payment_proof_url:   proofUrl,
+            notes:               catatan,
+            recurring_series_id: null,
+            cycle_status:        cycleStatusValue,
         });
-        newId = result.lastInsertRowid;
     } catch (err) {
         console.error("❌ [expense add] Database INSERT gagal:", err);
         return interaction.reply({
@@ -384,20 +468,12 @@ async function handleAdd(interaction) {
     }
 
     // ── INSERT sukses — bangun embed ───────────────────────────────────────
-    // Ambil row yang baru diinsert untuk dipakai buildLedgerEmbed
     const newRow = getExpenseById.get(newId);
-
-    // Untuk data baru, kita punya contentType dari attachment — lebih akurat dari heuristik URL
     const isImageFromAttachment = bukti.contentType?.startsWith("image/") ?? false;
-
     const { embed, isImage: isImageFromUrl } = buildLedgerEmbed(newRow, interaction.user.id);
 
-    // Gunakan contentType attachment (lebih akurat) untuk menentukan apakah image di embed
-    // Jika contentType bilang image tapi heuristik URL tidak, tetap tampilkan image
     const finalIsImage = isImageFromAttachment || isImageFromUrl;
     if (isImageFromAttachment && !isImageFromUrl) {
-        // buildLedgerEmbed tidak set image (karena ekstensi URL tidak dikenali),
-        // tapi attachment memang image — set manual
         embed.setImage(proofUrl);
     }
 
@@ -411,7 +487,6 @@ async function handleAdd(interaction) {
     );
 
     // ── Jika Discord post gagal ────────────────────────────────────────────
-    // Expense tetap tersimpan, ledger tracking tetap NULL — jangan rollback.
     if (!postResult.ok) {
         const channelPart = postResult.channelId ? ` ke <#${postResult.channelId}>` : "";
         return interaction.reply({
@@ -421,7 +496,7 @@ async function handleAdd(interaction) {
     }
 
     // ── Discord post berhasil — simpan ledger tracking ─────────────────────
-    const postedAt = new Date().toISOString(); // UTC ISO timestamp
+    const postedAt = new Date().toISOString();
     try {
         updateLedgerTracking.run({
             expenseId: newId,
@@ -430,8 +505,6 @@ async function handleAdd(interaction) {
         });
         console.log(`✅ [expense add #${newId}] Ledger tracking tersimpan: message=${postResult.message.id}`);
     } catch (err) {
-        // Ledger sudah terkirim ke Discord — ini hanya tracking failure, bukan critical error.
-        // Log warning tapi tetap laporkan sukses ke user.
         console.error(`⚠️ [expense add #${newId}] Ledger terkirim ke Discord tapi gagal simpan tracking:`, err);
     }
 
@@ -445,7 +518,6 @@ async function handleAdd(interaction) {
 async function handleRepost(interaction) {
     const expenseId = interaction.options.getInteger("id");
 
-    // ── Cari expense di DB (read-only) ─────────────────────────────────────
     const row = getExpenseById.get(expenseId);
 
     if (!row) {
@@ -455,17 +527,8 @@ async function handleRepost(interaction) {
         });
     }
 
-    // ── Guard: tiga state ledger eksplisit ────────────────────────────────
-    // State dibaca dari DB sebelum apapun dilakukan.
-    // Tiga state yang mungkin:
-    //   A. NULL             → expense belum punya ledger, boleh claim
-    //   B. 'PENDING'        → sedang diklaim oleh request lain dalam process ini
-    //                         (bukan stale dari crash — startup cleanup sudah bersihkan)
-    //   C. real message ID  → ledger sudah ada di Discord, jangan repost
     const currentLedgerMsgId = row.ledger_message_id ?? null;
 
-    // State B: PENDING — request lain sedang dalam proses Discord .send()
-    // JANGAN anggap ledger sudah ada, JANGAN buat URL /PENDING.
     if (currentLedgerMsgId === "PENDING") {
         return interaction.reply({
             content: `⏳ Expense **#${expenseId}** sedang diproses untuk ledger. Coba lagi setelah proses selesai.`,
@@ -473,12 +536,10 @@ async function handleRepost(interaction) {
         });
     }
 
-    // State C: real Discord message ID — ledger sudah ada
     if (currentLedgerMsgId !== null) {
         const channelId = process.env.EXPENSE_CHANNEL_ID;
         const guildId   = process.env.GUILD_ID;
 
-        // Bangun link ke message ledger existing (convenience, bukan business logic)
         let ledgerLink = "";
         if (guildId && channelId && currentLedgerMsgId) {
             ledgerLink = `\n\n🔗 [Lihat ledger existing](https://discord.com/channels/${guildId}/${channelId}/${currentLedgerMsgId})`;
@@ -490,26 +551,13 @@ async function handleRepost(interaction) {
         });
     }
 
-    // State A: NULL — attempt atomic claim dengan PENDING placeholder
-    // ──────────────────────────────────────────────────────────────────────
-    // Conditional UPDATE: hanya update jika ledger_message_id masih NULL.
-    // Jika dua /expense repost hampir bersamaan:
-    //   - Request A: UPDATE berhasil (changes=1) → lanjut ke Discord .send()
-    //   - Request B: UPDATE gagal (changes=0)   → ditolak, re-read state terbaru
-    // Proteksi race-condition minimal untuk single-instance Node.js.
-    //
-    // 'PENDING' adalah transient lock — bukan nilai final.
-    // postedAt saat claim ini adalah SEMENTARA dan akan di-overwrite dengan
-    // timestamp asli saat Discord .send() berhasil (lihat bagian final success).
     const claimResult = updateLedgerTracking.run({
         expenseId,
         messageId: "PENDING",
-        postedAt:  new Date().toISOString(), // transient — di-overwrite saat success
+        postedAt:  new Date().toISOString(),
     });
 
     if (claimResult.changes === 0) {
-        // Claim gagal — ada request lain yang lebih dulu mengisi slot ini.
-        // Re-read dari DB untuk memberi response yang akurat berdasarkan state terbaru.
         const freshRow      = getExpenseById.get(expenseId);
         const freshLedgerId = freshRow?.ledger_message_id ?? null;
 
@@ -533,18 +581,14 @@ async function handleRepost(interaction) {
             });
         }
 
-        // Fallback: state tidak terduga setelah re-read
         return interaction.reply({
             content: `⚠️ Expense **#${expenseId}** tidak dapat diproses saat ini. Coba lagi.`,
             ephemeral: true,
         });
     }
 
-    // ── Bangun embed dari data DB ──────────────────────────────────────────
-    // posterUserId = null karena kita tidak tahu user Discord original dari DB
     const { embed, isImage } = buildLedgerEmbed(row, null);
 
-    // ── Post ke channel ────────────────────────────────────────────────────
     const postResult = await postLedgerToChannel(
         interaction.client,
         embed,
@@ -554,8 +598,6 @@ async function handleRepost(interaction) {
     );
 
     if (!postResult.ok) {
-        // Discord post gagal — rollback PENDING placeholder ke NULL
-        // agar repost bisa dicoba kembali.
         try {
             db.prepare(`
                 UPDATE expenses
@@ -574,15 +616,10 @@ async function handleRepost(interaction) {
         });
     }
 
-    // ── Discord post berhasil — simpan real message ID dan timestamp final ──
-    // Timestamp ini (bukan timestamp saat claim PENDING) adalah nilai final
-    // ledger_posted_at — merepresentasikan waktu ledger benar-benar berhasil
-    // dipost ke Discord.
     const realMessageId = postResult.message.id;
-    const postedAt      = new Date().toISOString(); // timestamp final, overwrite nilai transient PENDING
+    const postedAt      = new Date().toISOString();
 
     try {
-        // Update baris yang masih PENDING dengan message ID asli dari Discord
         db.prepare(`
             UPDATE expenses
             SET ledger_message_id = ?, ledger_posted_at = ?
@@ -590,13 +627,141 @@ async function handleRepost(interaction) {
         `).run(realMessageId, postedAt, expenseId);
         console.log(`✅ [expense repost #${expenseId}] Ledger tracking tersimpan: message=${realMessageId}`);
     } catch (err) {
-        // Ledger sudah terkirim ke Discord — ini hanya tracking failure.
-        // Log error tapi tetap laporkan sukses ke user.
         console.error(`⚠️ [expense repost #${expenseId}] Ledger terkirim ke Discord tapi gagal update tracking:`, err);
     }
 
     return interaction.reply({
         content: `✅ Expense **#${expenseId}** berhasil dipost ke <#${postResult.channelId}>.`,
+        ephemeral: true,
+    });
+}
+
+// ─── Handler: /expense mark-paid ─────────────────────────────────────────────
+async function handleMarkPaid(interaction) {
+    const expenseId = interaction.options.getInteger("id");
+    const nominal   = interaction.options.getInteger("nominal");
+    const tanggal   = interaction.options.getString("tanggal").trim();
+    const nextDue   = interaction.options.getString("next_due").trim();
+    const bukti     = interaction.options.getAttachment("bukti");
+    const catatan   = interaction.options.getString("catatan")?.trim() ?? null;
+
+    // ── 1. Validasi Input ──────────────────────────────────────────────────
+    if (nominal <= 0) {
+        return interaction.reply({
+            content: "❌ **Nominal tidak valid.** Harus lebih dari 0.",
+            ephemeral: true,
+        });
+    }
+
+    if (!isValidDate(tanggal)) {
+        return interaction.reply({
+            content: `❌ **Format tanggal pembayaran tidak valid:** \`${tanggal}\`\nGunakan format \`YYYY-MM-DD\` dengan tanggal yang benar, contoh: \`2026-11-19\`.`,
+            ephemeral: true,
+        });
+    }
+
+    if (!isValidDate(nextDue)) {
+        return interaction.reply({
+            content: `❌ **Format \`next_due\` tidak valid:** \`${nextDue}\`\nGunakan format \`YYYY-MM-DD\` dengan tanggal yang benar.`,
+            ephemeral: true,
+        });
+    }
+
+    if (nextDue <= tanggal) {
+        return interaction.reply({
+            content: `❌ **\`next_due\` (${nextDue}) harus lebih besar dari tanggal pembayaran (${tanggal}).**`,
+            ephemeral: true,
+        });
+    }
+
+    // ── 2. Eksekusi Atomic SQLite Transaction ──────────────────────────────
+    let txResult;
+    try {
+        txResult = markPaidTransaction(expenseId, {
+            amount: nominal,
+            paid_at: tanggal,
+            next_due_at: nextDue,
+            payment_proof_url: bukti.url,
+            notes: catatan,
+        });
+    } catch (err) {
+        console.error(`❌ [expense mark-paid #${expenseId}] Transaction error:`, err);
+        if (err.message === "EXPENSE_NOT_FOUND") {
+            return interaction.reply({
+                content: `❌ Expense **#${expenseId}** tidak ditemukan di database.`,
+                ephemeral: true,
+            });
+        }
+        if (err.message === "NOT_RECURRING") {
+            return interaction.reply({
+                content: `❌ Expense **#${expenseId}** bukan pengeluaran recurring (\`is_recurring = 0\`). Subcommand ini khusus untuk perpanjangan tagihan recurring.`,
+                ephemeral: true,
+            });
+        }
+        if (err.message === "NOT_ACTIVE" || err.message === "CONCURRENT_CONFLICT") {
+            return interaction.reply({
+                content: `⚠️ Expense **#${expenseId}** sudah bukan siklus aktif (\`cycle_status != ACTIVE\`). Tagihan ini kemungkinan sudah ditandai lunas oleh proses lain atau Anda menggunakan ID siklus yang sudah lewat.`,
+                ephemeral: true,
+            });
+        }
+        if (err.message === "NO_SERIES_ID") {
+            return interaction.reply({
+                content: `❌ Expense **#${expenseId}** tidak memiliki \`recurring_series_id\` yang valid. Hubungi admin.`,
+                ephemeral: true,
+            });
+        }
+        return interaction.reply({
+            content: `❌ **Gagal memproses Mark Paid:** ${err.message}`,
+            ephemeral: true,
+        });
+    }
+
+    const { source, newExpenseId } = txResult;
+
+    // ── 3. Transaksi DB COMMIT sukses — Post ke #expenses ledger ───────────
+    const newRow = getExpenseById.get(newExpenseId);
+    const isImageFromAttachment = bukti.contentType?.startsWith("image/") ?? false;
+    const { embed, isImage: isImageFromUrl } = buildLedgerEmbed(newRow, interaction.user.id);
+
+    const finalIsImage = isImageFromAttachment || isImageFromUrl;
+    if (isImageFromAttachment && !isImageFromUrl) {
+        embed.setImage(bukti.url);
+    }
+
+    const postResult = await postLedgerToChannel(
+        interaction.client,
+        embed,
+        finalIsImage,
+        bukti.url,
+        `expense mark-paid #${newExpenseId}`
+    );
+
+    // ── 4. Jika Discord post gagal ─────────────────────────────────────────
+    // Database adalah SOURCE OF TRUTH. JANGAN rollback payment.
+    // Old cycle tetap SUPERSEDED, new cycle tetap ACTIVE, ledger tracking tetap NULL.
+    if (!postResult.ok) {
+        const channelPart = postResult.channelId ? ` ke <#${postResult.channelId}>` : "";
+        return interaction.reply({
+            content: `⚠️ Pembayaran tagihan **${source.name}** berhasil dicatat di database sebagai Expense **#${newExpenseId}**, tetapi gagal diposting ke ledger${channelPart}: ${postResult.errorMessage}\n\n**Jangan input ulang.** Gunakan \`/expense repost id:${newExpenseId}\` untuk memposting ulang ledger.`,
+            ephemeral: true,
+        });
+    }
+
+    // ── 5. Discord post berhasil — simpan ledger tracking ──────────────────
+    const postedAt = new Date().toISOString();
+    try {
+        updateLedgerTracking.run({
+            expenseId: newExpenseId,
+            messageId: postResult.message.id,
+            postedAt,
+        });
+        console.log(`✅ [expense mark-paid #${newExpenseId}] Ledger tracking tersimpan: message=${postResult.message.id}`);
+    } catch (err) {
+        console.error(`⚠️ [expense mark-paid #${newExpenseId}] Ledger terkirim tapi gagal update tracking:`, err);
+    }
+
+    return interaction.reply({
+        content: `✅ Tagihan **${source.name}** (Expense #${source.id}) berhasil ditandai **LUNAS**!\nSiklus baru tercatat sebagai Expense **#${newExpenseId}** di <#${postResult.channelId}> dengan jatuh tempo berikutnya pada **${formatTanggalReadable(newRow.next_due_at)}**.`,
         ephemeral: true,
     });
 }

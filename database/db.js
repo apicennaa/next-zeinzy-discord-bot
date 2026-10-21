@@ -27,11 +27,16 @@ db.exec(`
 
     notes TEXT,
 
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    ledger_message_id TEXT,
+    ledger_posted_at TEXT,
+    recurring_series_id INTEGER,
+    cycle_status TEXT
   )
 `);
 
-// ── Safe migration: tambah kolom ledger tracking jika belum ada ───────────────
+// ── Safe migration: schema upgrades & persistent tables ───────────────────────
 // Menggunakan PRAGMA table_info() untuk cek keberadaan kolom sebelum ALTER.
 // Restart bot berkali-kali aman — ALTER hanya dijalankan jika kolom belum ada.
 (function runMigrations() {
@@ -49,6 +54,58 @@ db.exec(`
         db.exec("ALTER TABLE expenses ADD COLUMN ledger_posted_at TEXT");
         console.log("✅ [DB Migration] Kolom 'ledger_posted_at' berhasil ditambahkan.");
     }
+
+    if (!existingColumns.includes("recurring_series_id")) {
+        db.exec("ALTER TABLE expenses ADD COLUMN recurring_series_id INTEGER");
+        console.log("✅ [DB Migration] Kolom 'recurring_series_id' berhasil ditambahkan.");
+    }
+
+    if (!existingColumns.includes("cycle_status")) {
+        db.exec("ALTER TABLE expenses ADD COLUMN cycle_status TEXT");
+        console.log("✅ [DB Migration] Kolom 'cycle_status' berhasil ditambahkan.");
+    }
+
+    // ── Backfill existing recurring series (idempotent) ───────────────────────
+    // Hanya baris dengan is_recurring = 1 dan belum memiliki recurring_series_id
+    // yang di-backfill. Founder recurring menggunakan own id sebagai series ID.
+    // Expense non-recurring (is_recurring = 0) dibiarkan tetap NULL.
+    const backfillResult = db.prepare(`
+        UPDATE expenses
+        SET recurring_series_id = id,
+            cycle_status = 'ACTIVE'
+        WHERE is_recurring = 1
+          AND recurring_series_id IS NULL
+    `).run();
+
+    if (backfillResult.changes > 0) {
+        console.log(`✅ [DB Migration] Backfill ${backfillResult.changes} existing recurring row(s) to ACTIVE recurring series.`);
+    }
+
+    // ── Partial UNIQUE index: maksimal 1 ACTIVE expense per recurring series ──
+    db.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS uniq_one_active_per_series
+        ON expenses(recurring_series_id)
+        WHERE cycle_status = 'ACTIVE';
+    `);
+
+    // ── Tabel reminder_log untuk tracking deduplikasi pengingat ───────────────
+    db.exec(`
+        CREATE TABLE IF NOT EXISTS reminder_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            expense_id INTEGER NOT NULL,
+            reminder_type TEXT NOT NULL,
+            sent_date_jakarta TEXT NOT NULL,
+            discord_message_id TEXT,
+            sent_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            FOREIGN KEY (expense_id) REFERENCES expenses(id)
+        )
+    `);
+
+    // ── Unique index: mencegah milestone yang sama dikirim ulang di hari Jakarta yang sama
+    db.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS uniq_reminder_per_day
+        ON reminder_log(expense_id, reminder_type, sent_date_jakarta);
+    `);
 })();
 
 // ── Startup stale-lock cleanup ────────────────────────────────────────────────
