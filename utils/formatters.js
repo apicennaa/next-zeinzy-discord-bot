@@ -111,6 +111,46 @@ function getReminderType(daysUntilDue) {
     return null;
 }
 
+/**
+ * Format Date ke string tanggal dan jam dalam timezone Asia/Jakarta (Bahasa Indonesia).
+ * Contoh: "23 Oktober 2026 pukul 05.00.00 WIB"
+ * @param {Date|string|number} [date=new Date()]
+ * @returns {string}
+ */
+function formatJakartaDateTime(date = new Date()) {
+    const d = typeof date === "string" || typeof date === "number" ? new Date(date) : date;
+    const formatted = new Intl.DateTimeFormat("id-ID", {
+        timeZone: "Asia/Jakarta",
+        day: "numeric",
+        month: "long",
+        year: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false,
+    }).format(d);
+    return `${formatted} WIB`;
+}
+
+/**
+ * Format durasi milidetik menjadi teks yang mudah dibaca ("X jam Y menit", "X menit", atau "X detik").
+ * @param {number|null} ms
+ * @returns {string}
+ */
+function formatDuration(ms) {
+    if (ms === null || ms === undefined || isNaN(ms)) return "-";
+    const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    if (hours > 0) {
+        return `${hours} jam ${minutes} menit`;
+    }
+    if (minutes > 0) {
+        return `${minutes} menit`;
+    }
+    return `${totalSeconds} detik`;
+}
+
 module.exports = {
     SCOPE_COLOR,
     isValidDate,
@@ -120,4 +160,6 @@ module.exports = {
     getJakartaHour,
     calculateDaysUntilDue,
     getReminderType,
+    formatJakartaDateTime,
+    formatDuration,
 };

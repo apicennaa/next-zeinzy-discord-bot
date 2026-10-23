@@ -10,6 +10,7 @@ const {
 const pingCommand = require("./commands/ping");
 const expenseCommand = require("./commands/expense");
 const { startReminderScheduler } = require("./scheduler/reminder");
+const { startWebsiteMonitor } = require("./scheduler/websiteMonitor");
 
 const client = new Client({
     intents: [GatewayIntentBits.Guilds],
@@ -39,6 +40,7 @@ async function registerCommands() {
 client.once("clientReady", () => {
     console.log(`✅ ZEINZY Bot ONLINE sebagai ${client.user.tag}`);
     startReminderScheduler(client);
+    startWebsiteMonitor(client);
 });
 
 client.on("interactionCreate", async interaction => {
