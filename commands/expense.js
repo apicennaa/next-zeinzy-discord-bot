@@ -6,6 +6,12 @@ const {
     formatTanggalReadable,
     SCOPE_COLOR,
 } = require("../utils/formatters");
+const {
+    isValidMonth,
+    getDefaultMonth,
+    getFinanceSummary,
+    buildSummaryEmbed,
+} = require("../services/financeSummary");
 
 // ─── Prepared statements ─────────────────────────────────────────────────────
 
@@ -367,6 +373,19 @@ module.exports = {
                         .setDescription("Catatan tambahan untuk siklus baru ini (opsional)")
                         .setRequired(false)
                 )
+        )
+
+        // ── Subcommand: summary ──────────────────────────────────────────────
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName("summary")
+                .setDescription("Lihat ringkasan pengeluaran bulanan ZEINZY (read-only)")
+                .addStringOption(option =>
+                    option
+                        .setName("bulan")
+                        .setDescription("Bulan summary (format: YYYY-MM, contoh: 2026-10. Default: bulan berjalan)")
+                        .setRequired(false)
+                )
         ),
 
     // ─── Execute ─────────────────────────────────────────────────────────────
@@ -376,6 +395,7 @@ module.exports = {
         if (sub === "add")       return handleAdd(interaction);
         if (sub === "repost")    return handleRepost(interaction);
         if (sub === "mark-paid") return handleMarkPaid(interaction);
+        if (sub === "summary")   return handleSummary(interaction);
 
         return interaction.reply({
             content: "⚠️ Subcommand tidak dikenal.",
@@ -764,4 +784,38 @@ async function handleMarkPaid(interaction) {
         content: `✅ Tagihan **${source.name}** (Expense #${source.id}) berhasil ditandai **LUNAS**!\nSiklus baru tercatat sebagai Expense **#${newExpenseId}** di <#${postResult.channelId}> dengan jatuh tempo berikutnya pada **${formatTanggalReadable(newRow.next_due_at)}**.`,
         ephemeral: true,
     });
+}
+
+// ─── Handler: /expense summary ───────────────────────────────────────────────
+async function handleSummary(interaction) {
+    const rawMonth = interaction.options.getString("bulan")?.trim();
+
+    let targetMonth;
+    if (rawMonth) {
+        if (!isValidMonth(rawMonth)) {
+            return interaction.reply({
+                content: `❌ **Format bulan tidak valid:** \`${rawMonth}\`\nGunakan format \`YYYY-MM\`, contoh: \`2026-10\`.`,
+                ephemeral: true,
+            });
+        }
+        targetMonth = rawMonth;
+    } else {
+        targetMonth = getDefaultMonth();
+    }
+
+    try {
+        const summaryData = getFinanceSummary(targetMonth);
+        const embed = buildSummaryEmbed(summaryData);
+
+        return interaction.reply({
+            embeds: [embed],
+            ephemeral: true,
+        });
+    } catch (err) {
+        console.error(`❌ [expense summary] Gagal mengambil summary bulan ${targetMonth}:`, err);
+        return interaction.reply({
+            content: "❌ **Gagal mengambil ringkasan pengeluaran.** Silakan coba lagi atau hubungi admin.",
+            ephemeral: true,
+        });
+    }
 }
